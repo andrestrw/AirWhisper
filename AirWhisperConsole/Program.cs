@@ -115,7 +115,7 @@ class Program
                 bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                 bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
 
-                if ((isWinKey && isCtrlPressed) || (isCtrlKey && isWinPressed))
+                if (isWinKey && isCtrlPressed)
                 {
                     if (!_isRecording)
                     {
