@@ -1,0 +1,6 @@
+faster-whisper
+funasr
+modelscope
+qwen-asr
+torch
+torchaudio
