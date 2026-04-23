@@ -32,8 +32,6 @@ class Program
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
 
-    [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
 
     [DllImport("user32.dll")]
     private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
@@ -61,6 +59,10 @@ class Program
     private static IntPtr _hookID = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
     private static bool _isRecording = false;
+    // Key state tracked internally to avoid calling GetAsyncKeyState from within the hook
+    // (calling Win32 input APIs inside WH_KEYBOARD_LL causes lock contention and system slowdown)
+    private static bool _winKeyDown = false;
+    private static bool _ctrlKeyDown = false;
     
     // --- NAudio State ---
     private static WaveInEvent? _waveSource;
@@ -107,32 +109,42 @@ class Program
             int vkCode = Marshal.ReadInt32(lParam);
             int message = wParam.ToInt32();
 
-            bool isWinKey = (vkCode == VK_LWIN || vkCode == VK_RWIN);
+            bool isWinKey  = (vkCode == VK_LWIN || vkCode == VK_RWIN);
             bool isCtrlKey = (vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL);
+
+            // Early exit: WH_KEYBOARD_LL blocks the entire keyboard queue synchronously.
+            // Do zero work for keys that are irrelevant to our shortcut.
+            if (!isWinKey && !isCtrlKey)
+                return CallNextHookEx(_hookID, nCode, wParam, lParam);
 
             if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
             {
-                bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+                // Update internal state (avoids calling GetAsyncKeyState inside the hook,
+                // which causes Win32 input lock contention at high keystroke frequency).
+                if (isWinKey)  _winKeyDown  = true;
+                if (isCtrlKey) _ctrlKeyDown = true;
 
-                if (isWinKey && isCtrlPressed)
+                // Trigger: Win pressed while Ctrl is already held (Ctrl → Win order).
+                if (isWinKey && _ctrlKeyDown)
                 {
                     if (!_isRecording)
                     {
                         StartRecording();
                     }
-                    return (IntPtr)1; // Suppress to avoid default Windows shortcuts opening (like Start Menu)
+                    return (IntPtr)1; // Suppress Win key to prevent Start Menu from opening.
                 }
             }
             else if (message == WM_KEYUP || message == WM_SYSKEYUP)
             {
+                if (isWinKey)  _winKeyDown  = false;
+                if (isCtrlKey) _ctrlKeyDown = false;
+
                 if (_isRecording && (isWinKey || isCtrlKey))
                 {
                     StopRecording();
-                    
                     // We DO NOT suppress the KeyUp event.
-                    // By passing it to the OS, we ensure that Windows correctly registers the key release.
-                    // This prevents the "stuck key" issue where the OS thinks a modifier is still active.
+                    // Passing it to the OS ensures Windows registers the release correctly,
+                    // preventing "stuck modifier" issues.
                 }
             }
         }
@@ -224,3 +236,4 @@ class Program
         }
     }
 }
+
