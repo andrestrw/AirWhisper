@@ -59,6 +59,7 @@ class Program
     private static IntPtr _hookID = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
     private static bool _isRecording = false;
+    private static bool _isTranscribing = false; // Prevents overlapping transcriptions
     // Key state tracked internally to avoid calling GetAsyncKeyState from within the hook
     // (calling Win32 input APIs inside WH_KEYBOARD_LL causes lock contention and system slowdown)
     private static bool _winKeyDown = false;
@@ -68,6 +69,10 @@ class Program
     private static WaveInEvent? _waveSource;
     private static WaveFileWriter? _waveFile;
     private static readonly string _outputFilePath = Path.Combine(Directory.GetCurrentDirectory(), "audio_prueba.wav");
+
+    // --- Python Brain Paths (Absolute) ---
+    private static readonly string _pythonScriptPath = Path.GetFullPath(
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "Distil-Whisper", "file.py"));
 
     static void Main(string[] args)
     {
@@ -233,6 +238,116 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"\nError stopping recording: {ex.Message}");
+        }
+
+        // Fire-and-forget: launch Python Brain on a ThreadPool thread so the
+        // keyboard hook callback returns immediately and doesn't block the input queue.
+        _ = Task.Run(() => RunBrainAsync());
+    }
+
+    /// <summary>
+    /// Launches the Python "Cerebro" process to transcribe the recorded audio.
+    /// Runs fully async to keep the main message loop and keyboard hook responsive.
+    /// </summary>
+    private static async Task RunBrainAsync()
+    {
+        if (_isTranscribing)
+        {
+            Console.WriteLine("[Brain] Transcription already in progress. Ignoring.");
+            return;
+        }
+        _isTranscribing = true;
+
+        try
+        {
+            // Small delay to let NAudio finish writing and disposing the WAV file.
+            await Task.Delay(200);
+
+            if (!File.Exists(_outputFilePath))
+            {
+                Console.WriteLine($"[Brain] ERROR: Audio file not found: {_outputFilePath}");
+                return;
+            }
+
+            Console.BackgroundColor = ConsoleColor.DarkYellow;
+            Console.ForegroundColor = ConsoleColor.Black;
+            Console.Write("\r[ TRANSCRIBING ]");
+            Console.ResetColor();
+            Console.WriteLine(" Python Brain is processing...");
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "python",
+                Arguments = $"\"{_pythonScriptPath}\" \"{_outputFilePath}\"",
+                CreateNoWindow = true,           // No CMD window popping up
+                UseShellExecute = false,         // Required for stream redirection
+                RedirectStandardOutput = true,    // Capture transcription text
+                RedirectStandardError = true      // Capture debug logs / errors
+            };
+
+            using var process = new Process { StartInfo = psi };
+            process.Start();
+
+            // Read both streams asynchronously to avoid deadlocks
+            // (if the process fills one buffer while we're blocking on the other).
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+
+            await process.WaitForExitAsync();
+
+            string transcription = (await stdoutTask).Trim();
+            string errorOutput = (await stderrTask).Trim();
+
+            // Log stderr (debug info from Python) to the console if present
+            if (!string.IsNullOrEmpty(errorOutput))
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"[Brain stderr] {errorOutput}");
+                Console.ResetColor();
+            }
+
+            if (process.ExitCode != 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[Brain] Python exited with code {process.ExitCode}");
+                Console.ResetColor();
+                return;
+            }
+
+            if (string.IsNullOrEmpty(transcription))
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[Brain] No transcription text received (empty output).");
+                Console.ResetColor();
+                return;
+            }
+
+            // --- SUCCESS ---
+            Console.Beep(1000, 150);
+            Console.BackgroundColor = ConsoleColor.DarkCyan;
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.Write("\r[ TRANSCRIBED ] ");
+            Console.ResetColor();
+            Console.WriteLine(transcription);
+
+            // TODO (Paso 2.4): Use InputSimulatorPlus to type the transcription
+            // into the active window instead of just printing it.
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Brain] Exception: {ex.Message}");
+            Console.ResetColor();
+        }
+        finally
+        {
+            _isTranscribing = false;
+
+            // Ready for next recording
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("Ready. Press CTRL+WIN to record again.");
+            Console.ResetColor();
         }
     }
 }
