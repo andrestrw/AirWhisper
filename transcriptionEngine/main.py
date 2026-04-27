@@ -39,6 +39,7 @@ _DEFAULT_LANGUAGE = {
     "whisper": "es",
     "sensevoice": "auto",
     "qwen": "es",
+    "uniasr": "es",   # Spanish-only model; language param is ignored by the model
 }
 
 _DONE_SENTINEL = "<<<DONE>>>"
