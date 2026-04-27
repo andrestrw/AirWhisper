@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.IO;
+using System.Text;
 using NAudio.Wave;
 
 namespace AirWhisperConsole;
@@ -32,7 +33,6 @@ class Program
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
 
-
     [DllImport("user32.dll")]
     private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
@@ -55,34 +55,51 @@ class Program
         public System.Drawing.Point pt;
     }
 
-    // --- State ---
+    // --- Keyboard State ---
     private static IntPtr _hookID = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
     private static bool _isRecording = false;
-    // Key state tracked internally to avoid calling GetAsyncKeyState from within the hook
-    // (calling Win32 input APIs inside WH_KEYBOARD_LL causes lock contention and system slowdown)
+    private static bool _isTranscribing = false;
     private static bool _winKeyDown = false;
     private static bool _ctrlKeyDown = false;
-    
+
     // --- NAudio State ---
     private static WaveInEvent? _waveSource;
     private static WaveFileWriter? _waveFile;
     private static readonly string _outputFilePath = Path.Combine(Directory.GetCurrentDirectory(), "audio_prueba.wav");
 
+    // --- Python Brain Paths ---
+    private static readonly string _pythonScriptPath = Path.GetFullPath(
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "transcriptionEngine", "main.py"));
+
+    private static string _selectedEngine = "whisper";
+
+    // --- Persistent Brain Process ---
+    private static Process? _brainProcess = null;
+    private static bool _brainReady = false;
+    private const string DoneSentinel = "<<<DONE>>>";
+
     static void Main(string[] args)
     {
+        if (args.Length > 0 && (args[0] == "sensevoice" || args[0] == "whisper" || args[0] == "qwen" || args[0] == "uniasr"))
+            _selectedEngine = args[0];
+
         Console.Clear();
         Console.Title = "AirWhisper - El Conserje";
         Console.WriteLine("========================================");
         Console.WriteLine("   AIRWHISPER: ACTIVE LISTENING");
         Console.WriteLine("========================================");
+        Console.WriteLine($"Engine: {_selectedEngine.ToUpper()}");
         Console.WriteLine("Shortcut: [CTRL + WINDOWS] (Keep to record)");
         Console.WriteLine("Press CTRL+C to exit.");
         Console.WriteLine();
 
+        // Start the Python brain process in the background so the model loads
+        // while the user is still reading the startup message.
+        _ = Task.Run(InitBrainAsync);
+
         _hookID = SetHook(_proc);
 
-        // Message loop (Required for Global Hooks)
         MSG msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0) != 0)
         {
@@ -90,16 +107,92 @@ class Program
             DispatchMessage(ref msg);
         }
 
+        ShutdownBrain();
         UnhookWindowsHookEx(_hookID);
     }
 
+    // -------------------------------------------------------------------------
+    // Persistent brain process lifecycle
+    // -------------------------------------------------------------------------
+
+    private static async Task InitBrainAsync()
+    {
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine($"[Brain] Loading {_selectedEngine.ToUpper()} model...");
+        Console.ResetColor();
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python",
+            Arguments = $"\"{_pythonScriptPath}\" --engine {_selectedEngine} --daemon",
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+
+        _brainProcess = new Process { StartInfo = psi };
+        _brainProcess.Start();
+
+        // Stream stderr continuously so the user sees model-loading progress.
+        _ = Task.Run(ReadStderrLoopAsync);
+
+        // Block until Python signals the model is ready.
+        var signal = await _brainProcess.StandardOutput.ReadLineAsync();
+        if (signal == "READY")
+        {
+            _brainReady = true;
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Brain] {_selectedEngine.ToUpper()} model ready. Press CTRL+WIN to record.");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Brain] Unexpected startup signal: '{signal}'");
+            Console.ResetColor();
+        }
+    }
+
+    private static async Task ReadStderrLoopAsync()
+    {
+        if (_brainProcess == null) return;
+        string? line;
+        while ((line = await _brainProcess.StandardError.ReadLineAsync()) != null)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"[Brain] {line}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void ShutdownBrain()
+    {
+        try
+        {
+            if (_brainProcess != null && !_brainProcess.HasExited)
+            {
+                _brainProcess.StandardInput.WriteLine("QUIT");
+                _brainProcess.StandardInput.Flush();
+                _brainProcess.WaitForExit(2000);
+                if (!_brainProcess.HasExited) _brainProcess.Kill();
+            }
+        }
+        catch { /* best-effort shutdown */ }
+    }
+
+    // -------------------------------------------------------------------------
+    // Keyboard Hook
+    // -------------------------------------------------------------------------
+
     private static IntPtr SetHook(LowLevelKeyboardProc proc)
     {
-        using (Process curProcess = Process.GetCurrentProcess())
-        using (ProcessModule curModule = curProcess.MainModule!)
-        {
-            return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName!), 0);
-        }
+        using Process curProcess = Process.GetCurrentProcess();
+        using ProcessModule curModule = curProcess.MainModule!;
+        return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName!), 0);
     }
 
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -112,26 +205,19 @@ class Program
             bool isWinKey  = (vkCode == VK_LWIN || vkCode == VK_RWIN);
             bool isCtrlKey = (vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL);
 
-            // Early exit: WH_KEYBOARD_LL blocks the entire keyboard queue synchronously.
-            // Do zero work for keys that are irrelevant to our shortcut.
+            // Early exit: do zero work for irrelevant keys.
             if (!isWinKey && !isCtrlKey)
                 return CallNextHookEx(_hookID, nCode, wParam, lParam);
 
             if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
             {
-                // Update internal state (avoids calling GetAsyncKeyState inside the hook,
-                // which causes Win32 input lock contention at high keystroke frequency).
                 if (isWinKey)  _winKeyDown  = true;
                 if (isCtrlKey) _ctrlKeyDown = true;
 
-                // Trigger: Win pressed while Ctrl is already held (Ctrl → Win order).
-                if (isWinKey && _ctrlKeyDown)
+                if (isWinKey && _ctrlKeyDown && !_isRecording)
                 {
-                    if (!_isRecording)
-                    {
-                        StartRecording();
-                    }
-                    return (IntPtr)1; // Suppress Win key to prevent Start Menu from opening.
+                    StartRecording();
+                    return (IntPtr)1; // suppress Win key → no Start Menu
                 }
             }
             else if (message == WM_KEYUP || message == WM_SYSKEYUP)
@@ -140,23 +226,22 @@ class Program
                 if (isCtrlKey) _ctrlKeyDown = false;
 
                 if (_isRecording && (isWinKey || isCtrlKey))
-                {
                     StopRecording();
-                    // We DO NOT suppress the KeyUp event.
-                    // Passing it to the OS ensures Windows registers the release correctly,
-                    // preventing "stuck modifier" issues.
-                }
             }
         }
         return CallNextHookEx(_hookID, nCode, wParam, lParam);
     }
+
+    // -------------------------------------------------------------------------
+    // Recording
+    // -------------------------------------------------------------------------
 
     private static void StartRecording()
     {
         if (_isRecording) return;
         _isRecording = true;
         Console.Beep(800, 100);
-        
+
         Console.BackgroundColor = ConsoleColor.DarkGreen;
         Console.ForegroundColor = ConsoleColor.White;
         Console.Write("\r[ RECORDING... ] ");
@@ -167,12 +252,10 @@ class Program
         {
             _waveSource = new WaveInEvent
             {
-                WaveFormat = new WaveFormat(16000, 1) // 16kHz Mono is optimal for Whisper
+                WaveFormat = new WaveFormat(16000, 1)
             };
-
             _waveSource.DataAvailable += WaveSource_DataAvailable;
             _waveSource.RecordingStopped += WaveSource_RecordingStopped;
-
             _waveFile = new WaveFileWriter(_outputFilePath, _waveSource.WaveFormat);
             _waveSource.StartRecording();
         }
@@ -185,55 +268,124 @@ class Program
 
     private static void WaveSource_DataAvailable(object? sender, WaveInEventArgs e)
     {
-        if (_waveFile != null)
-        {
-            _waveFile.Write(e.Buffer, 0, e.BytesRecorded);
-            _waveFile.Flush();
-        }
+        _waveFile?.Write(e.Buffer, 0, e.BytesRecorded);
+        _waveFile?.Flush();
     }
 
     private static void WaveSource_RecordingStopped(object? sender, StoppedEventArgs e)
     {
-        if (_waveSource != null)
-        {
-            _waveSource.Dispose();
-            _waveSource = null;
-        }
-
-        if (_waveFile != null)
-        {
-            _waveFile.Dispose();
-            _waveFile = null;
-        }
+        _waveSource?.Dispose();
+        _waveSource = null;
+        _waveFile?.Dispose();
+        _waveFile = null;
 
         if (e.Exception != null)
-        {
             Console.WriteLine($"\nRecording error: {e.Exception.Message}");
-        }
     }
 
     private static void StopRecording()
     {
         if (!_isRecording) return;
         _isRecording = false;
-        
         Console.Beep(600, 100);
 
         Console.BackgroundColor = ConsoleColor.DarkRed;
         Console.ForegroundColor = ConsoleColor.White;
         Console.Write("\r[ DETAINED ]    ");
         Console.ResetColor();
-        Console.WriteLine("Captured audio. Starting Brain (Python)...");
+        Console.WriteLine("Captured audio. Sending to Brain...");
+
+        _waveSource?.StopRecording();
+
+        _ = Task.Run(() => RunBrainAsync());
+    }
+
+    // -------------------------------------------------------------------------
+    // Transcription via persistent process
+    // -------------------------------------------------------------------------
+
+    private static async Task RunBrainAsync()
+    {
+        if (_isTranscribing)
+        {
+            Console.WriteLine("[Brain] Transcription already in progress. Ignoring.");
+            return;
+        }
+        _isTranscribing = true;
 
         try
         {
-            // This safely stops the recording. The disposal is handled in the RecordingStopped event.
-            _waveSource?.StopRecording();
+            // Let NAudio finish writing and disposing the WAV file.
+            await Task.Delay(200);
+
+            if (!_brainReady || _brainProcess == null || _brainProcess.HasExited)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[Brain] Model not ready yet — still loading. Please wait.");
+                Console.ResetColor();
+                return;
+            }
+
+            if (!File.Exists(_outputFilePath))
+            {
+                Console.WriteLine($"[Brain] ERROR: Audio file not found: {_outputFilePath}");
+                return;
+            }
+
+            Console.BackgroundColor = ConsoleColor.DarkYellow;
+            Console.ForegroundColor = ConsoleColor.Black;
+            Console.Write("\r[ TRANSCRIBING ]");
+            Console.ResetColor();
+            Console.WriteLine(" Sending audio to Brain...");
+
+            // Send the audio path to the persistent Python process via stdin.
+            await _brainProcess.StandardInput.WriteLineAsync(_outputFilePath);
+            await _brainProcess.StandardInput.FlushAsync();
+
+            // Read lines until the <<<DONE>>> sentinel.
+            var sb = new StringBuilder();
+            string? line;
+            while ((line = await _brainProcess.StandardOutput.ReadLineAsync()) != null)
+            {
+                if (line == DoneSentinel) break;
+                if (sb.Length > 0) sb.AppendLine();
+                sb.Append(line);
+            }
+
+            string transcription = sb.ToString().Trim();
+
+            if (string.IsNullOrEmpty(transcription))
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[Brain] No transcription text received (empty output).");
+                Console.ResetColor();
+                return;
+            }
+
+            // --- SUCCESS ---
+            Console.Beep(1000, 150);
+            Console.BackgroundColor = ConsoleColor.DarkCyan;
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.Write("\r[ TRANSCRIBED ] ");
+            Console.ResetColor();
+            Console.WriteLine(transcription);
+
+            // TODO (Paso 2.4): Use InputSimulatorPlus to type the transcription
+            // into the active window instead of just printing it.
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\nError stopping recording: {ex.Message}");
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Brain] Exception: {ex.Message}");
+            Console.ResetColor();
+        }
+        finally
+        {
+            _isTranscribing = false;
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("Ready. Press CTRL+WIN to record again.");
+            Console.ResetColor();
         }
     }
 }
-

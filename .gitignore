@@ -1,7 +1,14 @@
 /notes
 /skills
 
-# .NET
+# --- OS / IDE ---
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- .NET / C# ---
 bin/
 obj/
 *.pdb
@@ -11,8 +18,46 @@ obj/
 *.runtimeconfig.json
 *.cache
 *.log
+*.user
+*.suo
+*.userosscache
+*.sln.doccache
 
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Audio / Temp
+# --- Audio & Data ---
 *.wav
+*.mp3
+*.m4a
+*.flac
+temp/
+tmp/
+
 
