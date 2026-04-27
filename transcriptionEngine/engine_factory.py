@@ -9,7 +9,7 @@ from engines.base import TranscriptionEngine
 
 
 # Registry of supported engine names — used for argparse choices and error messages.
-AVAILABLE_ENGINES = ("whisper", "sensevoice", "qwen")
+AVAILABLE_ENGINES = ("whisper", "sensevoice", "qwen", "uniasr")
 
 
 
@@ -41,7 +41,13 @@ def create_engine(engine_name: str) -> TranscriptionEngine:
 
         return QwenEngine(model_id="Qwen/Qwen3-ASR-0.6B", device="cpu")
 
+    if engine_name == "uniasr":
+        from engines.uniasr_engine import UniASREngine
 
+        return UniASREngine(
+            model_id="iic/speech_UniASR_asr_2pass-es-16k-common-vocab3445-tensorflow1-online",
+            device="cpu",
+        )
     raise ValueError(
         f"Motor desconocido: '{engine_name}'. "
         f"Opciones válidas: {', '.join(AVAILABLE_ENGINES)}"

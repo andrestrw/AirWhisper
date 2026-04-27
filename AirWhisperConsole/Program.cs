@@ -81,7 +81,7 @@ class Program
 
     static void Main(string[] args)
     {
-        if (args.Length > 0 && (args[0] == "sensevoice" || args[0] == "whisper" || args[0] == "qwen"))
+        if (args.Length > 0 && (args[0] == "sensevoice" || args[0] == "whisper" || args[0] == "qwen" || args[0] == "uniasr"))
             _selectedEngine = args[0];
 
         Console.Clear();
