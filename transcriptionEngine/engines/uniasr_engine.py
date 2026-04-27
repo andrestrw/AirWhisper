@@ -41,14 +41,24 @@ class UniASREngine(TranscriptionEngine):
             file=sys.stderr,
         )
         # IMPORTANT: Do NOT import AutoModel until the patch is ready.
-        
-        # 1. Use ModelScope's official downloader to get the exact local path
-        print("[UniASREngine] Verificando/Descargando modelo desde ModelScope...", file=sys.stderr)
-        from modelscope.hub.snapshot_download import snapshot_download
-        with contextlib.redirect_stdout(sys.stderr):
-            # snapshot_download returns the actual local directory path
-            model_dir = snapshot_download(self._model_id)
-        
+
+        # 1. Resolve local cache path (ModelScope convention)
+        model_cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "modelscope", "hub", "models",
+            self._model_id.replace("/", os.sep),
+        )
+
+        if os.path.isdir(model_cache_dir):
+            # Model already cached — skip network call entirely
+            print("[UniASREngine] Modelo encontrado en caché local.", file=sys.stderr)
+            model_dir = model_cache_dir
+        else:
+            # First run: download from ModelScope
+            print("[UniASREngine] Descargando modelo desde ModelScope (solo primera vez)...", file=sys.stderr)
+            from modelscope.hub.snapshot_download import snapshot_download
+            with contextlib.redirect_stdout(sys.stderr):
+                model_dir = snapshot_download(self._model_id)
+
         model_py = os.path.join(model_dir, "model.py")
 
         # 2. Apply Windows Patch BEFORE any funasr imports
