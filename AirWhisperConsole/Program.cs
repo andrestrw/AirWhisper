@@ -3,6 +3,8 @@ using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using NAudio.Wave;
+using WindowsInput;
+using WindowsInput.Native;
 
 namespace AirWhisperConsole;
 
@@ -78,6 +80,9 @@ class Program
     private static Process? _brainProcess = null;
     private static bool _brainReady = false;
     private const string DoneSentinel = "<<<DONE>>>";
+
+    // --- Input Simulator ---
+    private static readonly InputSimulator _inputSimulator = new InputSimulator();
 
     static void Main(string[] args)
     {
@@ -370,8 +375,8 @@ class Program
             Console.ResetColor();
             Console.WriteLine(transcription);
 
-            // TODO (Paso 2.4): Use InputSimulatorPlus to type the transcription
-            // into the active window instead of just printing it.
+            // Inject the transcribed text into the active window.
+            TypeTranscription(transcription);
         }
         catch (Exception ex)
         {
@@ -385,6 +390,65 @@ class Program
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine("Ready. Press CTRL+WIN to record again.");
+            Console.ResetColor();
+        }
+    }
+    /// <summary>
+    /// Injects the transcribed text into the currently focused window
+    /// using clipboard paste for speed and full Unicode support.
+    /// Preserves the user's previous clipboard content.
+    /// </summary>
+    private static void TypeTranscription(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        try
+        {
+            // 1. Save current clipboard content (best-effort)
+            string? previousClipboard = null;
+            var staThread = new Thread(() =>
+            {
+                try
+                {
+                    if (System.Windows.Forms.Clipboard.ContainsText())
+                        previousClipboard = System.Windows.Forms.Clipboard.GetText();
+
+                    // 2. Set transcription text to clipboard
+                    System.Windows.Forms.Clipboard.SetText(text);
+                }
+                catch { /* Clipboard may be locked by another process */ }
+            });
+            staThread.SetApartmentState(ApartmentState.STA);
+            staThread.Start();
+            staThread.Join(1000); // Safety timeout
+
+            // 3. Brief pause to let the target window regain focus
+            Thread.Sleep(80);
+
+            // 4. Simulate Ctrl+V to paste
+            _inputSimulator.Keyboard.ModifiedKeyStroke(
+                VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
+
+            // 5. Brief pause to let the paste complete
+            Thread.Sleep(50);
+
+            // 6. Restore previous clipboard content (best-effort)
+            if (previousClipboard != null)
+            {
+                var restoreThread = new Thread(() =>
+                {
+                    try { System.Windows.Forms.Clipboard.SetText(previousClipboard); }
+                    catch { }
+                });
+                restoreThread.SetApartmentState(ApartmentState.STA);
+                restoreThread.Start();
+                restoreThread.Join(1000);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[TypeSim] Could not paste text: {ex.Message}");
             Console.ResetColor();
         }
     }
